@@ -414,7 +414,7 @@ void run_backward_gpu(const float* dQ, const float* dK, const float* dV,
 int main() {
     // Small sanity test
     const int B = 1, H = 1, N = 64, d = 64;
-    const int Br = 32, Bc = 32;
+    const int Br = 16, Bc = 16;  // Reduced tile sizes to fit in shared memory
 
     // Host buffers
     std::vector<float> hQ((size_t)B * H * N * d), hK((size_t)B * H * N * d), hV((size_t)B * H * N * d);
