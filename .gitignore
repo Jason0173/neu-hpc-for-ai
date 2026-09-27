@@ -1,0 +1,16 @@
+# OS / editors
+.DS_Store
+.vs/
+.vscode/
+
+# Build output
+*.exe
+*.obj
+*.pdb
+*.o
+*.class
+build/
+
+# Python
+__pycache__/
+*.pyc

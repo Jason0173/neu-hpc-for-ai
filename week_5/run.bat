@@ -6,8 +6,8 @@ REM Set up Visual Studio environment
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 
 REM Compile the code
-echo Compiling kernel.cu...
-nvcc kernel.cu -o flashattention2.exe -std=c++17 -O3 -arch=sm_89
+echo Compiling flash_attention2.cu...
+nvcc flash_attention2.cu -o flashattention2.exe -std=c++17 -O3 -arch=sm_89
 
 if %errorlevel% equ 0 (
     echo.
