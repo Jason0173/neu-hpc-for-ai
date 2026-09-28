@@ -24,7 +24,7 @@ static inline float dot(const float* a, const float* b, int d) {
   for (int i=0;i<d;++i) s += a[i]*b[i];
   return s;
 }
-static inline float maxf(float a, float b){ return a>b?a:b; }
+__host__ __device__ static inline float maxf(float a, float b){ return a>b?a:b; }
 
 
 void attention_naive_cpu(const float* Q, const float* K, const float* V,
@@ -117,87 +117,6 @@ void flash_attention_cpu(const float* Q, const float* K, const float* V,
   free(s_buf);
 }
 
-
-template<int ROWS_PER_BLOCK, int BLOCK_N>
-__global__ void flash_attn_kernel(const float* __restrict__ Q,
-                                  const float* __restrict__ K,
-                                  const float* __restrict__ V,
-                                  float* __restrict__ O,
-                                  int N, int d, bool causal)
-{
-  extern __shared__ float smem[]; 
-
-  float* Q_s = smem;
-  float* K_s = Q_s + ROWS_PER_BLOCK * d;
-  float* V_s = K_s + BLOCK_N * d;
-
-  const int row_in_block = threadIdx.y;      // 0..ROWS_PER_BLOCK-1
-  const int lane         = threadIdx.x;      // 0..(blockDim.x-1)
-  const int i = blockIdx.x * ROWS_PER_BLOCK + row_in_block;
-
-  if (i >= N) return;
-
-  const float scale = 1.f / sqrtf((float)d);
-
- 
-  for (int t = lane; t < d; t += blockDim.x) {
-    Q_s[row_in_block*d + t] = Q[i*d + t];
-  }
-  __syncthreads();
-
-  float m = -INFINITY;     // running max
-  float l = 0.f;
-  extern __shared__ __align__(16) unsigned char __smem_pad[];
-  float* acc_t = nullptr; 
-
-  for (int j0=0; j0<N; j0+=BLOCK_N) {
-    const int bn = min(BLOCK_N, N - j0);
-
-    const int tile_elems = bn * d;
-    for (int t = lane; t < tile_elems; t += blockDim.x) {
-      int r = t / d, c = t % d;
-      K_s[r*d + c] = K[(j0 + r)*d + c];
-      V_s[r*d + c] = V[(j0 + r)*d + c];
-    }
-    __syncthreads();
-
-    float mt = -INFINITY;
-    for (int jj=0; jj<bn; ++jj){
-      // s = (Qi·Kj) * scale
-      const float* Qi = Q_s + row_in_block*d;
-      const float* Kj = K_s + jj*d;
-      float s = 0.f;
-      for (int c=0;c<d;++c) s += Qi[c]*Kj[c];
-      s *= scale;
-      if (causal && (j0+jj) > i) s = -INFINITY;
-      mt = maxf(mt, s);
-    }
-
-    float lt = 0.f;
-
-    if (j0 == 0){
-      for (int c=0;c<d;++c) O[i*d + c] = 0.f;
-    }
-
-    for (int jj=0; jj<bn; ++jj){
-      const float* Qi = Q_s + row_in_block*d;
-      const float* Kj = K_s + jj*d;
-      float s = 0.f;
-      for (int c=0;c<d;++c) s += Qi[c]*Kj[c];
-      s *= scale;
-      if (causal && (j0+jj) > i) continue; // masked
-      float p = expf(s - mt);
-      lt += p;
-      const float* Vj = V_s + jj*d;
-      for (int c=0;c<d;++c) O[i*d + c] += p * Vj[c];
-    }
-
-    float m_new = maxf(m, mt);
-    float alpha = (m == -INFINITY)? 0.f : expf(m  - m_new);
-    float beta  = (mt== -INFINITY)? 0.f : expf(mt - m_new);
-
-    // l
-    l = l*alpha + lt*beta;
 
 template<int ROWS_PER_BLOCK, int BLOCK_N>
 __global__ void flash_attn_kernel_smemacc(const float* __restrict__ Q,
