@@ -23,6 +23,15 @@ bash bench/run_all.sh
 
 This builds everything for the local GPU architecture and runs all benchmarks, which takes a few minutes. It writes `results/*.csv`, `plots/*.png` and `RESULTS.md`.
 
+**No local GPU?** `modal_run.py` runs the same script on a [Modal](https://modal.com) cloud GPU and copies the results back:
+
+```bash
+pip install modal && modal setup   # once
+modal run bench/modal_run.py       # NVIDIA L4 by default; --gpu A10G etc. also work
+```
+
+The L4 has the same Ada Lovelace architecture (sm_89) as RTX 40-series cards.
+
 ## What is measured
 
 - **Precision:** all course kernels are FP32. The GEMM baseline is cuBLAS SGEMM in plain FP32, not TF32. The attention baselines are PyTorch SDPA in FP32 (memory-efficient kernel) and in FP16 (FlashAttention kernel), the setup PyTorch would use in practice.
