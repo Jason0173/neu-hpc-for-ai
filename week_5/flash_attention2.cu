@@ -253,11 +253,13 @@ __global__ void fa2_forward_kernel(
 
 // Backward kernel (col-tiles parallel). Recompute S,P; accumulate dV,dK locally;
 // dQ gets atomicAdd across col-tiles.
+// Inside a block, each thread owns one K/V column, so it is the only writer of that
+// column's dK/dV, and D_i = rowsum(dO_i * O_i) is computed once per row.
 __global__ void fa2_backward_kernel(
     const float* __restrict__ Q,   // [B*H, N, d]
     const float* __restrict__ K,   // [B*H, N, d]
     const float* __restrict__ V,   // [B*H, N, d]
-    const float* __restrict__ O,   // [B*H, N, d] (not strictly needed but kept for completeness)
+    const float* __restrict__ O,   // [B*H, N, d] (used for D_i = rowsum(dO_i * O_i))
     const float* __restrict__ dO,  // [B*H, N, d]
     const float* __restrict__ L,   // [B*H, N]   (logsumexp per row from fwd)
     float* __restrict__ dQ,        // [B*H, N, d]
@@ -275,6 +277,7 @@ __global__ void fa2_backward_kernel(
     const float* Qbh = Q + ((size_t)hb * N * d);
     const float* Kbh = K + ((size_t)hb * N * d);
     const float* Vbh = V + ((size_t)hb * N * d);
+    const float* Obh = O + ((size_t)hb * N * d);
     const float* dObh = dO + ((size_t)hb * N * d);
     const float* Lbh = L + ((size_t)hb * N);
     float* dQbh = dQ + ((size_t)hb * N * d);
@@ -282,13 +285,14 @@ __global__ void fa2_backward_kernel(
     float* dVbh = dV + ((size_t)hb * N * d);
 
     extern __shared__ float smem[];
-    // [ Ks (Bc*d) | Vs (Bc*d) | Qs (Br*d) | dOs (Br*d) | Ls (Br) | dK_local (Bc*d) | dV_local (Bc*d) ]
+    // [ Ks (Bc*d) | Vs (Bc*d) | Qs (Br*d) | dOs (Br*d) | Ls (Br) | Ds (Br) | dK_local (Bc*d) | dV_local (Bc*d) ]
     float* Ks = smem;
     float* Vs = Ks + (size_t)Bc * d;
     float* Qs = Vs + (size_t)Bc * d;
     float* dOs = Qs + (size_t)Br * d;
     float* Ls = dOs + (size_t)Br * d;
-    float* dK_local = Ls + Br;
+    float* Ds = Ls + Br;
+    float* dK_local = Ds + Br;
     float* dV_local = dK_local + (size_t)Bc * d;
 
     // Load K/V tile
@@ -316,60 +320,48 @@ __global__ void fa2_backward_kernel(
             Qs[x] = Qbh[(row0 * d) + x];
         for (int x = threadIdx.x; x < rows * d; x += blockDim.x)
             dOs[x] = dObh[(row0 * d) + x];
-        for (int r = threadIdx.x; r < rows; r += blockDim.x)
+        for (int r = threadIdx.x; r < rows; r += blockDim.x) {
             Ls[r] = Lbh[row0 + r];
+            // D_i = sum_j P_ij * dP_ij over the WHOLE row, which equals dO_i . O_i.
+            // (The old code summed only over this block's columns, which is wrong when N > Bc.)
+            const float* oi = Obh + (size_t)(row0 + r) * d;
+            const float* doi = dObh + (size_t)(row0 + r) * d;
+            float Di = 0.f;
+            for (int kk = 0; kk < d; ++kk) Di += doi[kk] * oi[kk];
+            Ds[r] = Di;
+        }
         __syncthreads();
 
-        // Each thread handles one row 
-        for (int r_local = threadIdx.x; r_local < rows; r_local += blockDim.x) {
-            const float* qi = Qs + r_local * d;
-            const float* doi = dOs + r_local * d;
-            const float Li = Ls[r_local];
+        // Each thread owns one K/V column j of this tile. Only that thread writes
+        // dK_local[j] and dV_local[j], so the accumulation has no race. (The old code
+        // gave each thread a row, so several threads added into the same column at once.)
+        for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+            const float* kj = Ks + j * d;
+            const float* vj = Vs + j * d;
+            float* dKj = dK_local + j * d;
+            float* dVj = dV_local + j * d;
+            for (int r_local = 0; r_local < rows; ++r_local) {
+                const float* qi = Qs + r_local * d;
+                const float* doi = dOs + r_local * d;
 
-            // Pass 1: compute D_i = sum_j [ (dO_i · V_j) * P_ij ]
-            double Di = 0.0;
-            for (int j = 0; j < cols; ++j) {
-                // s_ij
-                float s = 0.f;
-                const float* kj = Ks + j * d;
-                for (int kk = 0; kk < d; ++kk) s += qi[kk] * kj[kk];
-                float Pij = expf(s - Li);
+                // s_ij = Q_i . K_j and dP_ij = dO_i . V_j in one pass
+                float s = 0.f, dPij = 0.f;
+                for (int kk = 0; kk < d; ++kk) {
+                    s += qi[kk] * kj[kk];
+                    dPij += doi[kk] * vj[kk];
+                }
+                const float Pij = expf(s - Ls[r_local]);
+                const float dSij = Pij * (dPij - Ds[r_local]);  // softmax backward
 
-                // dP_ij = dO_i · V_j
-                float dPij = 0.f;
-                const float* vj = Vs + j * d;
-                for (int kk = 0; kk < d; ++kk) dPij += doi[kk] * vj[kk];
+                for (int kk = 0; kk < d; ++kk) {
+                    dVj[kk] += Pij * doi[kk];   // dV_j += P_ij * dO_i
+                    dKj[kk] += dSij * qi[kk];   // dK_j += dS_ij * Q_i
+                }
 
-                Di += (double)(Pij * dPij);
-            }
-
-            // Pass 2: accumulate dV_local, dK_local, atomicAdd dQ
-            for (int j = 0; j < cols; ++j) {
-                // s_ij & P_ij
-                float s = 0.f;
-                const float* kj = Ks + j * d;
-                for (int kk = 0; kk < d; ++kk) s += qi[kk] * kj[kk];
-                float Pij = expf(s - Li);
-
-                // dP_ij
-                float dPij = 0.f;
-                const float* vj = Vs + j * d;
-                for (int kk = 0; kk < d; ++kk) dPij += doi[kk] * vj[kk];
-
-                float dSij = Pij * (dPij - (float)Di);  // softmax backward
-
-                // dQ_i += dS_ij * K_j   (atomicAdd across col-tiles)
-                float* dQi = dQbh + (row0 + r_local) * d;
+                // dQ_i += dS_ij * K_j: other threads and other column tiles update the same row
+                float* dQi = dQbh + (size_t)(row0 + r_local) * d;
                 for (int kk = 0; kk < d; ++kk)
                     atomicAdd(&dQi[kk], dSij * kj[kk]);
-
-                // dK_j += dS_ij * Q_i   (local)
-                for (int kk = 0; kk < d; ++kk)
-                    dK_local[j * d + kk] += dSij * qi[kk];
-
-                // dV_j += P_ij * dO_i   (local)
-                for (int kk = 0; kk < d; ++kk)
-                    dV_local[j * d + kk] += Pij * doi[kk];
             }
         }
         __syncthreads();
@@ -404,7 +396,7 @@ void run_backward_gpu(const float* dQ, const float* dK, const float* dV,
 {
     dim3 grid(div_up(N, Bc), B * H);
     int threads = 128; 
-    size_t smem_floats = (size_t)Bc * d * 2 + (size_t)Br * d * 2 + Br + (size_t)Bc * d * 2; // Ks,Vs,Qs,dOs,Ls,dKloc,dVloc
+    size_t smem_floats = (size_t)Bc * d * 2 + (size_t)Br * d * 2 + 2 * Br + (size_t)Bc * d * 2; // Ks,Vs,Qs,dOs,Ls,Ds,dKloc,dVloc
     size_t smem_bytes = smem_floats * sizeof(float);
     fa2_backward_kernel << <grid, threads, smem_bytes >> > (dQ, dK, dV, dO, ddO, dL, ddQ, ddK, ddV, N, d, Br, Bc);
     CUDA_CHECK(cudaGetLastError());
